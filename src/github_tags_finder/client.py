@@ -8,13 +8,16 @@ from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
-
+from typing import Any
+import time
+import logging
+from functools import lru_cache
 
 API_VERSION = "2022-11-28"
 DEFAULT_API_URL = "https://api.github.com"
 MAX_SEARCH_RESULTS = 1_000
 
-
+logger = logging.getLogger(__name__)
 class GitHubError(RuntimeError):
     """A GitHub API request failed."""
 
@@ -25,6 +28,8 @@ class SearchResult:
     total_count: int
     incomplete_results: bool
     items: list[dict[str, Any]]
+    rate_limit_remaining: int | None = None
+    rate_limit_reset: int | None = None
 
 
 class GitHubClient:
@@ -41,6 +46,7 @@ class GitHubClient:
         self.timeout = timeout
         self._opener = opener
 
+    @lru_cache(maxsize=32)
     def search_issues(
         self,
         query: str,
@@ -49,6 +55,11 @@ class GitHubClient:
         sort: str = "updated",
         direction: str = "desc",
     ) -> SearchResult:
+        logger.debug(f"Searching issues with query: {query}")
+        if not query or not query.strip():
+            raise ValueError("query cannot be empty")
+        if len(query) > 256:
+            raise ValueError("query exceeds GitHub's 256 character limit")
         if not 1 <= limit <= MAX_SEARCH_RESULTS:
             raise ValueError(f"limit must be between 1 and {MAX_SEARCH_RESULTS}")
 
@@ -93,32 +104,39 @@ class GitHubClient:
         )
 
     def _get_json(self, path: str) -> dict[str, Any]:
-        headers = {
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": API_VERSION,
-            "User-Agent": "github-tags-finder",
-        }
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
-        request = Request(f"{self.api_url}{path}", headers=headers)
-
+    max_retries = 3
+    for attempt in range(max_retries):
         try:
-            with self._opener(request, timeout=self.timeout) as response:
-                payload = json.load(response)
-        except HTTPError as error:
-            raise self._http_error(error) from error
-        except URLError as error:
-            reason = getattr(error, "reason", error)
-            raise GitHubError(f"Could not reach GitHub: {reason}") from error
-        except (json.JSONDecodeError, UnicodeDecodeError) as error:
-            raise GitHubError(
-                "GitHub returned a response that was not valid JSON"
-            ) from error
+            headers = {
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": API_VERSION,
+                "User-Agent": "github-tags-finder",
+            }
+            if self.token:
+                headers["Authorization"] = f"Bearer {self.token}"
+            request = Request(f"{self.api_url}{path}", headers=headers)
 
-        if not isinstance(payload, dict):
-            raise GitHubError("GitHub returned an unexpected response")
-        return payload
+            try:
+                with self._opener(request, timeout=self.timeout) as response:
+                    payload = json.load(response)
+            except HTTPError as error:
+                raise self._http_error(error) from error
+            except URLError as error:
+                reason = getattr(error, "reason", error)
+                raise GitHubError(f"Could not reach GitHub: {reason}") from error
+            except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                raise GitHubError(
+                    "GitHub returned a response that was not valid JSON"
+                ) from error
 
+            if not isinstance(payload, dict):
+                raise GitHubError("GitHub returned an unexpected response")
+            return payload
+        except GitHubError:
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(2 ** attempt)  # exponential backoff
+            
     @staticmethod
     def _http_error(error: HTTPError) -> GitHubError:
         message = ""
@@ -135,6 +153,9 @@ class GitHubClient:
             hint = " Check GITHUB_TOKEN/GH_TOKEN and the account's API rate limit."
         elif error.code == 422:
             hint = " Check the generated search query with --query-only."
+        elif error.code == 429:
+            reset_time = error.headers.get("X-RateLimit-Reset")
+            hint = f" Rate limited. Resets at Unix timestamp {reset_time}."
         return GitHubError(
             f"GitHub API request failed ({error.code}){detail}.{hint}".rstrip()
         )
